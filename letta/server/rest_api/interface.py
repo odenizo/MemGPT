@@ -7,6 +7,7 @@ from datetime import datetime
 from typing import AsyncGenerator, Literal, Optional, Union
 
 from letta.constants import DEFAULT_MESSAGE_TOOL, DEFAULT_MESSAGE_TOOL_KWARG
+from letta.helpers.datetime_helpers import is_utc_datetime
 from letta.interface import AgentInterface
 from letta.local_llm.constants import INNER_THOUGHTS_KWARG
 from letta.schemas.enums import MessageStreamStatus
@@ -25,7 +26,6 @@ from letta.schemas.message import Message
 from letta.schemas.openai.chat_completion_response import ChatCompletionChunkResponse
 from letta.streaming_interface import AgentChunkStreamingInterface
 from letta.streaming_utils import FunctionArgumentsStreamHandler, JSONInnerThoughtsExtractor
-from letta.utils import is_utc_datetime
 
 
 # TODO strip from code / deprecate
@@ -315,7 +315,10 @@ class StreamingServerInterface(AgentChunkStreamingInterface):
 
         # extra prints
         self.debug = False
-        self.timeout = 30
+        self.timeout = 10 * 60  # 10 minute timeout
+
+        # for expect_reasoning_content, we should accumulate `content`
+        self.expect_reasoning_content_buffer = None
 
     def _reset_inner_thoughts_json_reader(self):
         # A buffer for accumulating function arguments (we want to buffer keys and run checks on each one)
@@ -330,7 +333,7 @@ class StreamingServerInterface(AgentChunkStreamingInterface):
         while self._active:
             try:
                 # Wait until there is an item in the deque or the stream is deactivated
-                await asyncio.wait_for(self._event.wait(), timeout=self.timeout)  # 30 second timeout
+                await asyncio.wait_for(self._event.wait(), timeout=self.timeout)
             except asyncio.TimeoutError:
                 break  # Exit the loop if we timeout
 
@@ -387,6 +390,39 @@ class StreamingServerInterface(AgentChunkStreamingInterface):
         # Wipe the inner thoughts buffers
         self._reset_inner_thoughts_json_reader()
 
+        # If we were in reasoning mode and accumulated a json block, attempt to release it as chunks
+        # if self.expect_reasoning_content_buffer is not None:
+        #     try:
+        #         # NOTE: this is hardcoded for our DeepSeek API integration
+        #         json_reasoning_content = json.loads(self.expect_reasoning_content_buffer)
+
+        #         if "name" in json_reasoning_content:
+        #             self._push_to_buffer(
+        #                 ToolCallMessage(
+        #                     id=message_id,
+        #                     date=message_date,
+        #                     tool_call=ToolCallDelta(
+        #                         name=json_reasoning_content["name"],
+        #                         arguments=None,
+        #                         tool_call_id=None,
+        #                     ),
+        #                 )
+        #             )
+        #         if "arguments" in json_reasoning_content:
+        #             self._push_to_buffer(
+        #                 ToolCallMessage(
+        #                     id=message_id,
+        #                     date=message_date,
+        #                     tool_call=ToolCallDelta(
+        #                         name=None,
+        #                         arguments=json_reasoning_content["arguments"],
+        #                         tool_call_id=None,
+        #                     ),
+        #                 )
+        #             )
+        #     except Exception as e:
+        #         print(f"Failed to interpret reasoning content ({self.expect_reasoning_content_buffer}) as JSON: {e}")
+
     def step_complete(self):
         """Signal from the agent that one 'step' finished (step = LLM response + tool execution)"""
         if not self.multi_step:
@@ -410,7 +446,13 @@ class StreamingServerInterface(AgentChunkStreamingInterface):
         return
 
     def _process_chunk_to_letta_style(
-        self, chunk: ChatCompletionChunkResponse, message_id: str, message_date: datetime
+        self,
+        chunk: ChatCompletionChunkResponse,
+        message_id: str,
+        message_date: datetime,
+        # if we expect `reasoning_content``, then that's what gets mapped to ReasoningMessage
+        # and `content` needs to be handled outside the interface
+        expect_reasoning_content: bool = False,
     ) -> Optional[Union[ReasoningMessage, ToolCallMessage, AssistantMessage]]:
         """
         Example data from non-streaming response looks like:
@@ -424,8 +466,74 @@ class StreamingServerInterface(AgentChunkStreamingInterface):
         choice = chunk.choices[0]
         message_delta = choice.delta
 
+        if (
+            message_delta.content is None
+            and (expect_reasoning_content and message_delta.reasoning_content is None)
+            and message_delta.tool_calls is None
+            and message_delta.function_call is None
+            and choice.finish_reason is None
+            and chunk.model.startswith("claude-")
+        ):
+            # First chunk of Anthropic is empty
+            return None
+
         # inner thoughts
-        if message_delta.content is not None:
+        if expect_reasoning_content and message_delta.reasoning_content is not None:
+            processed_chunk = ReasoningMessage(
+                id=message_id,
+                date=message_date,
+                reasoning=message_delta.reasoning_content,
+            )
+        elif expect_reasoning_content and message_delta.content is not None:
+            # "ignore" content if we expect reasoning content
+            if self.expect_reasoning_content_buffer is None:
+                self.expect_reasoning_content_buffer = message_delta.content
+            else:
+                self.expect_reasoning_content_buffer += message_delta.content
+
+            # we expect this to be pure JSON
+            # OptimisticJSONParser
+
+            # If we can pull a name out, pull it
+
+            try:
+                # NOTE: this is hardcoded for our DeepSeek API integration
+                json_reasoning_content = json.loads(self.expect_reasoning_content_buffer)
+                print(f"json_reasoning_content: {json_reasoning_content}")
+
+                processed_chunk = ToolCallMessage(
+                    id=message_id,
+                    date=message_date,
+                    tool_call=ToolCallDelta(
+                        name=json_reasoning_content.get("name"),
+                        arguments=json.dumps(json_reasoning_content.get("arguments")),
+                        tool_call_id=None,
+                    ),
+                )
+
+            except json.JSONDecodeError as e:
+                print(f"Failed to interpret reasoning content ({self.expect_reasoning_content_buffer}) as JSON: {e}")
+
+                return None
+            # Else,
+            # return None
+            # processed_chunk = ToolCallMessage(
+            #     id=message_id,
+            #     date=message_date,
+            #     tool_call=ToolCallDelta(
+            #         # name=tool_call_delta.get("name"),
+            #         name=None,
+            #         arguments=message_delta.content,
+            #         # tool_call_id=tool_call_delta.get("id"),
+            #         tool_call_id=None,
+            #     ),
+            # )
+            # return processed_chunk
+
+            # TODO eventually output as tool call outputs?
+            # print(f"Hiding content delta stream: '{message_delta.content}'")
+            # return None
+        elif message_delta.content is not None:
             processed_chunk = ReasoningMessage(
                 id=message_id,
                 date=message_date,
@@ -472,7 +580,7 @@ class StreamingServerInterface(AgentChunkStreamingInterface):
                         processed_chunk = AssistantMessage(
                             id=message_id,
                             date=message_date,
-                            assistant_message=cleaned_func_args,
+                            content=cleaned_func_args,
                         )
 
                 # otherwise we just do a regular passthrough of a ToolCallDelta via a ToolCallMessage
@@ -486,15 +594,24 @@ class StreamingServerInterface(AgentChunkStreamingInterface):
                         if tool_call.function.name:
                             tool_call_delta["name"] = tool_call.function.name
 
-                    processed_chunk = ToolCallMessage(
-                        id=message_id,
-                        date=message_date,
-                        tool_call=ToolCallDelta(
-                            name=tool_call_delta.get("name"),
-                            arguments=tool_call_delta.get("arguments"),
-                            tool_call_id=tool_call_delta.get("id"),
-                        ),
-                    )
+                    # We might end up with a no-op, in which case we should omit
+                    if (
+                        tool_call_delta.get("name") is None
+                        and tool_call_delta.get("arguments") in [None, ""]
+                        and tool_call_delta.get("id") is None
+                    ):
+                        processed_chunk = None
+                        print("skipping empty chunk...")
+                    else:
+                        processed_chunk = ToolCallMessage(
+                            id=message_id,
+                            date=message_date,
+                            tool_call=ToolCallDelta(
+                                name=tool_call_delta.get("name"),
+                                arguments=tool_call_delta.get("arguments"),
+                                tool_call_id=tool_call_delta.get("id"),
+                            ),
+                        )
 
             elif self.inner_thoughts_in_kwargs and tool_call.function:
                 processed_chunk = None
@@ -515,6 +632,11 @@ class StreamingServerInterface(AgentChunkStreamingInterface):
                         self.function_id_buffer += tool_call.id
 
                 if tool_call.function.arguments:
+                    # if chunk.model.startswith("claude-"):
+                    # updates_main_json = tool_call.function.arguments
+                    # updates_inner_thoughts = ""
+                    # else:  # OpenAI
+                    # updates_main_json, updates_inner_thoughts = self.function_args_reader.process_fragment(tool_call.function.arguments)
                     updates_main_json, updates_inner_thoughts = self.function_args_reader.process_fragment(tool_call.function.arguments)
 
                     # If we have inner thoughts, we should output them as a chunk
@@ -585,7 +707,6 @@ class StreamingServerInterface(AgentChunkStreamingInterface):
                             ):
                                 # do an additional parse on the updates_main_json
                                 if self.function_args_buffer:
-
                                     updates_main_json = self.function_args_buffer + updates_main_json
                                     self.function_args_buffer = None
 
@@ -613,7 +734,7 @@ class StreamingServerInterface(AgentChunkStreamingInterface):
                                     processed_chunk = AssistantMessage(
                                         id=message_id,
                                         date=message_date,
-                                        assistant_message=combined_chunk,
+                                        content=combined_chunk,
                                     )
                                     # Store the ID of the tool call so allow skipping the corresponding response
                                     if self.function_id_buffer:
@@ -627,7 +748,7 @@ class StreamingServerInterface(AgentChunkStreamingInterface):
                                     processed_chunk = AssistantMessage(
                                         id=message_id,
                                         date=message_date,
-                                        assistant_message=updates_main_json,
+                                        content=updates_main_json,
                                     )
                                     # Store the ID of the tool call so allow skipping the corresponding response
                                     if self.function_id_buffer:
@@ -774,15 +895,24 @@ class StreamingServerInterface(AgentChunkStreamingInterface):
                     if tool_call.function.name:
                         tool_call_delta["name"] = tool_call.function.name
 
-                processed_chunk = ToolCallMessage(
-                    id=message_id,
-                    date=message_date,
-                    tool_call=ToolCallDelta(
-                        name=tool_call_delta.get("name"),
-                        arguments=tool_call_delta.get("arguments"),
-                        tool_call_id=tool_call_delta.get("id"),
-                    ),
-                )
+                # We might end up with a no-op, in which case we should omit
+                if (
+                    tool_call_delta.get("name") is None
+                    and tool_call_delta.get("arguments") in [None, ""]
+                    and tool_call_delta.get("id") is None
+                ):
+                    processed_chunk = None
+                    print("skipping empty chunk...")
+                else:
+                    processed_chunk = ToolCallMessage(
+                        id=message_id,
+                        date=message_date,
+                        tool_call=ToolCallDelta(
+                            name=tool_call_delta.get("name"),
+                            arguments=tool_call_delta.get("arguments"),
+                            tool_call_id=tool_call_delta.get("id"),
+                        ),
+                    )
 
         elif choice.finish_reason is not None:
             # skip if there's a finish
@@ -854,7 +984,13 @@ class StreamingServerInterface(AgentChunkStreamingInterface):
 
         return processed_chunk
 
-    def process_chunk(self, chunk: ChatCompletionChunkResponse, message_id: str, message_date: datetime):
+    def process_chunk(
+        self,
+        chunk: ChatCompletionChunkResponse,
+        message_id: str,
+        message_date: datetime,
+        expect_reasoning_content: bool = False,
+    ):
         """Process a streaming chunk from an OpenAI-compatible server.
 
         Example data from non-streaming response looks like:
@@ -874,8 +1010,12 @@ class StreamingServerInterface(AgentChunkStreamingInterface):
             # processed_chunk = self._process_chunk_to_openai_style(chunk)
             raise NotImplementedError("OpenAI proxy streaming temporarily disabled")
         else:
-            processed_chunk = self._process_chunk_to_letta_style(chunk=chunk, message_id=message_id, message_date=message_date)
-
+            processed_chunk = self._process_chunk_to_letta_style(
+                chunk=chunk,
+                message_id=message_id,
+                message_date=message_date,
+                expect_reasoning_content=expect_reasoning_content,
+            )
         if processed_chunk is None:
             return
 
@@ -959,7 +1099,7 @@ class StreamingServerInterface(AgentChunkStreamingInterface):
                             processed_chunk = AssistantMessage(
                                 id=msg_obj.id,
                                 date=msg_obj.created_at,
-                                assistant_message=func_args["message"],
+                                content=func_args["message"],
                             )
                             self._push_to_buffer(processed_chunk)
                         except Exception as e:
@@ -981,7 +1121,7 @@ class StreamingServerInterface(AgentChunkStreamingInterface):
                         processed_chunk = AssistantMessage(
                             id=msg_obj.id,
                             date=msg_obj.created_at,
-                            assistant_message=func_args[self.assistant_message_tool_kwarg],
+                            content=func_args[self.assistant_message_tool_kwarg],
                         )
                         # Store the ID of the tool call so allow skipping the corresponding response
                         self.prev_assistant_message_id = function_call.id
@@ -1017,8 +1157,6 @@ class StreamingServerInterface(AgentChunkStreamingInterface):
             msg = msg.replace("Success: ", "")
             # new_message = {"function_return": msg, "status": "success"}
             assert msg_obj.tool_call_id is not None
-
-            print(f"YYY printing the function call - {msg_obj.tool_call_id} == {self.prev_assistant_message_id} ???")
 
             # Skip this is use_assistant_message is on
             if self.use_assistant_message and msg_obj.tool_call_id == self.prev_assistant_message_id:

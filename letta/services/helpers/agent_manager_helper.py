@@ -4,6 +4,7 @@ from typing import List, Literal, Optional
 from letta import system
 from letta.constants import IN_CONTEXT_MEMORY_KEYWORD, STRUCTURED_OUTPUT_MODELS
 from letta.helpers import ToolRulesSolver
+from letta.helpers.datetime_helpers import get_local_time
 from letta.orm.agent import Agent as AgentModel
 from letta.orm.agents_tags import AgentsTags
 from letta.orm.errors import NoResultFound
@@ -11,11 +12,10 @@ from letta.prompts import gpt_system
 from letta.schemas.agent import AgentState, AgentType
 from letta.schemas.enums import MessageRole
 from letta.schemas.memory import Memory
-from letta.schemas.message import Message, MessageCreate
+from letta.schemas.message import Message, MessageCreate, TextContent
 from letta.schemas.tool_rule import ToolRule
 from letta.schemas.user import User
 from letta.system import get_initial_boot_messages, get_login_event
-from letta.utils import get_local_time
 
 
 # Static methods
@@ -118,6 +118,27 @@ def compile_memory_metadata_block(
     return memory_metadata_block
 
 
+class PreserveMapping(dict):
+    """Used to preserve (do not modify) undefined variables in the system prompt"""
+
+    def __missing__(self, key):
+        return "{" + key + "}"
+
+
+def safe_format(template: str, variables: dict) -> str:
+    """
+    Safely formats a template string, preserving empty {} and {unknown_vars}
+    while substituting known variables.
+
+    If we simply use {} in format_map, it'll be treated as a positional field
+    """
+    # First escape any empty {} by doubling them
+    escaped = template.replace("{}", "{{}}")
+
+    # Now use format_map with our custom mapping
+    return escaped.format_map(PreserveMapping(variables))
+
+
 def compile_system_message(
     system_prompt: str,
     in_context_memory: Memory,
@@ -169,7 +190,7 @@ def compile_system_message(
 
         # render the variables using the built-in templater
         try:
-            formatted_prompt = system_prompt.format_map(variables)
+            formatted_prompt = safe_format(system_prompt, variables)
         except Exception as e:
             raise ValueError(f"Failed to format system prompt - {str(e)}. System prompt value:\n{system_prompt}")
 
@@ -234,17 +255,24 @@ def package_initial_message_sequence(
 
         if message_create.role == MessageRole.user:
             packed_message = system.package_user_message(
-                user_message=message_create.text,
+                user_message=message_create.content,
             )
         elif message_create.role == MessageRole.system:
             packed_message = system.package_system_message(
-                system_message=message_create.text,
+                system_message=message_create.content,
             )
         else:
             raise ValueError(f"Invalid message role: {message_create.role}")
 
         init_messages.append(
-            Message(role=message_create.role, text=packed_message, organization_id=actor.organization_id, agent_id=agent_id, model=model)
+            Message(
+                role=message_create.role,
+                content=[TextContent(text=packed_message)],
+                name=message_create.name,
+                organization_id=actor.organization_id,
+                agent_id=agent_id,
+                model=model,
+            )
         )
     return init_messages
 

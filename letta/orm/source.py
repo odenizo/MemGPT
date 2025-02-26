@@ -1,6 +1,6 @@
 from typing import TYPE_CHECKING, List, Optional
 
-from sqlalchemy import JSON
+from sqlalchemy import JSON, Index
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from letta.orm import FileMetadata
@@ -23,6 +23,11 @@ class Source(SqlalchemyBase, OrganizationMixin):
     __tablename__ = "sources"
     __pydantic_model__ = PydanticSource
 
+    __table_args__ = (
+        Index(f"source_created_at_id_idx", "created_at", "id"),
+        {"extend_existing": True},
+    )
+
     name: Mapped[str] = mapped_column(doc="the name of the source, must be unique within the org", nullable=False)
     description: Mapped[str] = mapped_column(nullable=True, doc="a human-readable description of the source")
     embedding_config: Mapped[EmbeddingConfig] = mapped_column(EmbeddingConfigColumn, doc="Configuration settings for embedding.")
@@ -37,6 +42,6 @@ class Source(SqlalchemyBase, OrganizationMixin):
         secondary="sources_agents",
         back_populates="sources",
         lazy="selectin",
-        cascade="all, delete",  # Ensures rows in sources_agents are deleted when the source is deleted
-        passive_deletes=True,  # Allows the database to handle deletion of orphaned rows
+        cascade="save-update",  # Only propagate save and update operations
+        passive_deletes=True,  # Let the database handle deletions
     )

@@ -2,14 +2,16 @@ from datetime import datetime
 from typing import Dict, List, Optional
 
 import numpy as np
-from sqlalchemy import Select, func, literal, select, union_all
+from sqlalchemy import Select, and_, func, literal, or_, select, union_all
 
 from letta.constants import BASE_MEMORY_TOOLS, BASE_TOOLS, MAX_EMBEDDING_DIM, MULTI_AGENT_TOOLS
 from letta.embeddings import embedding_model
+from letta.helpers.datetime_helpers import get_utc_time
 from letta.log import get_logger
 from letta.orm import Agent as AgentModel
 from letta.orm import AgentPassage, AgentsTags
 from letta.orm import Block as BlockModel
+from letta.orm import Identity as IdentityModel
 from letta.orm import Source as SourceModel
 from letta.orm import SourcePassage, SourcesAgents
 from letta.orm import Tool as ToolModel
@@ -19,14 +21,20 @@ from letta.orm.sqlite_functions import adapt_array
 from letta.schemas.agent import AgentState as PydanticAgentState
 from letta.schemas.agent import AgentType, CreateAgent, UpdateAgent
 from letta.schemas.block import Block as PydanticBlock
+from letta.schemas.block import BlockUpdate
 from letta.schemas.embedding_config import EmbeddingConfig
 from letta.schemas.llm_config import LLMConfig
+from letta.schemas.memory import Memory
 from letta.schemas.message import Message as PydanticMessage
 from letta.schemas.message import MessageCreate
 from letta.schemas.passage import Passage as PydanticPassage
 from letta.schemas.source import Source as PydanticSource
+from letta.schemas.tool import Tool as PydanticTool
+from letta.schemas.tool_rule import ContinueToolRule as PydanticContinueToolRule
+from letta.schemas.tool_rule import TerminalToolRule as PydanticTerminalToolRule
 from letta.schemas.tool_rule import ToolRule as PydanticToolRule
 from letta.schemas.user import User as PydanticUser
+from letta.serialize_schemas import SerializedAgentSchema
 from letta.services.block_manager import BlockManager
 from letta.services.helpers.agent_manager_helper import (
     _process_relationship,
@@ -37,11 +45,12 @@ from letta.services.helpers.agent_manager_helper import (
     initialize_message_sequence,
     package_initial_message_sequence,
 )
+from letta.services.identity_manager import IdentityManager
 from letta.services.message_manager import MessageManager
 from letta.services.source_manager import SourceManager
 from letta.services.tool_manager import ToolManager
 from letta.settings import settings
-from letta.utils import enforce_types, get_utc_time, united_diff
+from letta.utils import enforce_types, united_diff
 
 logger = get_logger(__name__)
 
@@ -51,13 +60,14 @@ class AgentManager:
     """Manager class to handle business logic related to Agents."""
 
     def __init__(self):
-        from letta.server.server import db_context
+        from letta.server.db import db_context
 
         self.session_maker = db_context
         self.block_manager = BlockManager()
         self.tool_manager = ToolManager()
         self.source_manager = SourceManager()
         self.message_manager = MessageManager()
+        self.identity_manager = IdentityManager()
 
     # ======================================================================================================================
     # Basic CRUD operations
@@ -73,15 +83,11 @@ class AgentManager:
         if not agent_create.llm_config or not agent_create.embedding_config:
             raise ValueError("llm_config and embedding_config are required")
 
-        # Check tool rules are valid
-        if agent_create.tool_rules:
-            check_supports_structured_output(model=agent_create.llm_config.model, tool_rules=agent_create.tool_rules)
-
         # create blocks (note: cannot be linked into the agent_id is created)
         block_ids = list(agent_create.block_ids or [])  # Create a local copy to avoid modifying the original
         if agent_create.memory_blocks:
             for create_block in agent_create.memory_blocks:
-                block = self.block_manager.create_or_update_block(PydanticBlock(**create_block.model_dump()), actor=actor)
+                block = self.block_manager.create_or_update_block(PydanticBlock(**create_block.model_dump(to_orm=True)), actor=actor)
                 block_ids.append(block.id)
 
         # TODO: Remove this block once we deprecate the legacy `tools` field
@@ -95,6 +101,25 @@ class AgentManager:
             tool_names.extend(agent_create.tools)
         # Remove duplicates
         tool_names = list(set(tool_names))
+
+        # add default tool rules
+        if agent_create.include_base_tool_rules:
+            if not agent_create.tool_rules:
+                tool_rules = []
+            else:
+                tool_rules = agent_create.tool_rules
+
+            # apply default tool rules
+            for tool_name in tool_names:
+                if tool_name == "send_message" or tool_name == "send_message_to_agent_async":
+                    tool_rules.append(PydanticTerminalToolRule(tool_name=tool_name))
+                elif tool_name in BASE_TOOLS:
+                    tool_rules.append(PydanticContinueToolRule(tool_name=tool_name))
+        else:
+            tool_rules = agent_create.tool_rules
+        # Check tool rules are valid
+        if agent_create.tool_rules:
+            check_supports_structured_output(model=agent_create.llm_config.model, tool_rules=agent_create.tool_rules)
 
         tool_ids = agent_create.tool_ids or []
         for tool_name in tool_names:
@@ -115,10 +140,15 @@ class AgentManager:
             tool_ids=tool_ids,
             source_ids=agent_create.source_ids or [],
             tags=agent_create.tags or [],
+            identity_ids=agent_create.identity_ids or [],
             description=agent_create.description,
-            metadata_=agent_create.metadata_,
-            tool_rules=agent_create.tool_rules,
+            metadata=agent_create.metadata,
+            tool_rules=tool_rules,
             actor=actor,
+            project_id=agent_create.project_id,
+            template_id=agent_create.template_id,
+            base_template_id=agent_create.base_template_id,
+            message_buffer_autoclear=agent_create.message_buffer_autoclear,
         )
 
         # If there are provided environment variables, add them in
@@ -175,9 +205,14 @@ class AgentManager:
         tool_ids: List[str],
         source_ids: List[str],
         tags: List[str],
+        identity_ids: List[str],
         description: Optional[str] = None,
-        metadata_: Optional[Dict] = None,
+        metadata: Optional[Dict] = None,
         tool_rules: Optional[List[PydanticToolRule]] = None,
+        project_id: Optional[str] = None,
+        template_id: Optional[str] = None,
+        base_template_id: Optional[str] = None,
+        message_buffer_autoclear: bool = False,
     ) -> PydanticAgentState:
         """Create a new agent."""
         with self.session_maker() as session:
@@ -190,8 +225,12 @@ class AgentManager:
                 "embedding_config": embedding_config,
                 "organization_id": actor.organization_id,
                 "description": description,
-                "metadata_": metadata_,
+                "metadata_": metadata,
                 "tool_rules": tool_rules,
+                "project_id": project_id,
+                "template_id": template_id,
+                "base_template_id": base_template_id,
+                "message_buffer_autoclear": message_buffer_autoclear,
             }
 
             # Create the new agent using SqlalchemyBase.create
@@ -200,6 +239,8 @@ class AgentManager:
             _process_relationship(session, new_agent, "sources", SourceModel, source_ids, replace=True)
             _process_relationship(session, new_agent, "core_memory", BlockModel, block_ids, replace=True)
             _process_tags(new_agent, tags, replace=True)
+            _process_relationship(session, new_agent, "identities", IdentityModel, identity_ids, replace=True)
+
             new_agent.create(session, actor=actor)
 
             # Convert to PydanticAgentState and return
@@ -241,11 +282,27 @@ class AgentManager:
             agent = AgentModel.read(db_session=session, identifier=agent_id, actor=actor)
 
             # Update scalar fields directly
-            scalar_fields = {"name", "system", "llm_config", "embedding_config", "message_ids", "tool_rules", "description", "metadata_"}
+            scalar_fields = {
+                "name",
+                "system",
+                "llm_config",
+                "embedding_config",
+                "message_ids",
+                "tool_rules",
+                "description",
+                "metadata",
+                "project_id",
+                "template_id",
+                "base_template_id",
+                "message_buffer_autoclear",
+            }
             for field in scalar_fields:
                 value = getattr(agent_update, field, None)
                 if value is not None:
-                    setattr(agent, field, value)
+                    if field == "metadata":
+                        setattr(agent, "metadata_", value)
+                    else:
+                        setattr(agent, field, value)
 
             # Update relationships using _process_relationship and _process_tags
             if agent_update.tool_ids is not None:
@@ -256,6 +313,8 @@ class AgentManager:
                 _process_relationship(session, agent, "core_memory", BlockModel, agent_update.block_ids, replace=True)
             if agent_update.tags is not None:
                 _process_tags(agent, agent_update.tags, replace=True)
+            if agent_update.identity_ids is not None:
+                _process_relationship(session, agent, "identities", IdentityModel, agent_update.identity_ids, replace=True)
 
             # Commit and refresh the agent
             agent.update(session, actor=actor)
@@ -267,11 +326,13 @@ class AgentManager:
     def list_agents(
         self,
         actor: PydanticUser,
+        before: Optional[str] = None,
+        after: Optional[str] = None,
+        limit: Optional[int] = 50,
         tags: Optional[List[str]] = None,
         match_all_tags: bool = False,
-        cursor: Optional[str] = None,
-        limit: Optional[int] = 50,
         query_text: Optional[str] = None,
+        identifier_keys: Optional[List[str]] = None,
         **kwargs,
     ) -> List[PydanticAgentState]:
         """
@@ -280,12 +341,14 @@ class AgentManager:
         with self.session_maker() as session:
             agents = AgentModel.list(
                 db_session=session,
+                before=before,
+                after=after,
+                limit=limit,
                 tags=tags,
                 match_all_tags=match_all_tags,
-                cursor=cursor,
-                limit=limit,
                 organization_id=actor.organization_id if actor else None,
                 query_text=query_text,
+                identifier_keys=identifier_keys,
                 **kwargs,
             )
 
@@ -322,6 +385,24 @@ class AgentManager:
             # Retrieve the agent
             agent = AgentModel.read(db_session=session, identifier=agent_id, actor=actor)
             agent.hard_delete(session)
+
+    @enforce_types
+    def serialize(self, agent_id: str, actor: PydanticUser) -> dict:
+        with self.session_maker() as session:
+            # Retrieve the agent
+            agent = AgentModel.read(db_session=session, identifier=agent_id, actor=actor)
+            schema = SerializedAgentSchema(session=session)
+            return schema.dump(agent)
+
+    @enforce_types
+    def deserialize(self, serialized_agent: dict, actor: PydanticUser) -> PydanticAgentState:
+        # TODO: Use actor to override fields
+        with self.session_maker() as session:
+            schema = SerializedAgentSchema(session=session)
+            agent = schema.load(serialized_agent, session=session)
+            agent.organization_id = actor.organization_id
+            agent = agent.create(session, actor=actor)
+            return agent.to_pydantic()
 
     # ======================================================================================================================
     # Per Agent Environment Variable Management
@@ -450,33 +531,40 @@ class AgentManager:
             )
             message = self.message_manager.create_message(message, actor=actor)
             message_ids = [message.id] + agent_state.message_ids[1:]  # swap index 0 (system)
-            return self.set_in_context_messages(agent_id=agent_id, message_ids=message_ids, actor=actor)
+            return self._set_in_context_messages(agent_id=agent_id, message_ids=message_ids, actor=actor)
         else:
             return agent_state
 
     @enforce_types
-    def set_in_context_messages(self, agent_id: str, message_ids: List[str], actor: PydanticUser) -> PydanticAgentState:
+    def _set_in_context_messages(self, agent_id: str, message_ids: List[str], actor: PydanticUser) -> PydanticAgentState:
         return self.update_agent(agent_id=agent_id, agent_update=UpdateAgent(message_ids=message_ids), actor=actor)
 
     @enforce_types
     def trim_older_in_context_messages(self, num: int, agent_id: str, actor: PydanticUser) -> PydanticAgentState:
         message_ids = self.get_agent_by_id(agent_id=agent_id, actor=actor).message_ids
         new_messages = [message_ids[0]] + message_ids[num:]  # 0 is system message
-        return self.set_in_context_messages(agent_id=agent_id, message_ids=new_messages, actor=actor)
+        return self._set_in_context_messages(agent_id=agent_id, message_ids=new_messages, actor=actor)
+
+    @enforce_types
+    def trim_all_in_context_messages_except_system(self, agent_id: str, actor: PydanticUser) -> PydanticAgentState:
+        message_ids = self.get_agent_by_id(agent_id=agent_id, actor=actor).message_ids
+        # TODO: How do we know this?
+        new_messages = [message_ids[0]]  # 0 is system message
+        return self._set_in_context_messages(agent_id=agent_id, message_ids=new_messages, actor=actor)
 
     @enforce_types
     def prepend_to_in_context_messages(self, messages: List[PydanticMessage], agent_id: str, actor: PydanticUser) -> PydanticAgentState:
         message_ids = self.get_agent_by_id(agent_id=agent_id, actor=actor).message_ids
         new_messages = self.message_manager.create_many_messages(messages, actor=actor)
         message_ids = [message_ids[0]] + [m.id for m in new_messages] + message_ids[1:]
-        return self.set_in_context_messages(agent_id=agent_id, message_ids=message_ids, actor=actor)
+        return self._set_in_context_messages(agent_id=agent_id, message_ids=message_ids, actor=actor)
 
     @enforce_types
     def append_to_in_context_messages(self, messages: List[PydanticMessage], agent_id: str, actor: PydanticUser) -> PydanticAgentState:
         messages = self.message_manager.create_many_messages(messages, actor=actor)
         message_ids = self.get_agent_by_id(agent_id=agent_id, actor=actor).message_ids or []
         message_ids += [m.id for m in messages]
-        return self.set_in_context_messages(agent_id=agent_id, message_ids=message_ids, actor=actor)
+        return self._set_in_context_messages(agent_id=agent_id, message_ids=message_ids, actor=actor)
 
     @enforce_types
     def reset_messages(self, agent_id: str, actor: PydanticUser, add_default_initial_messages: bool = False) -> PydanticAgentState:
@@ -527,11 +615,45 @@ class AgentManager:
             )
             return self.append_to_in_context_messages([system_message], agent_id=agent_state.id, actor=actor)
 
+    # TODO: I moved this from agent.py - replace all mentions of this with the agent_manager version
+    @enforce_types
+    def update_memory_if_changed(self, agent_id: str, new_memory: Memory, actor: PydanticUser) -> PydanticAgentState:
+        """
+        Update internal memory object and system prompt if there have been modifications.
+
+        Args:
+            new_memory (Memory): the new memory object to compare to the current memory object
+
+        Returns:
+            modified (bool): whether the memory was updated
+        """
+        agent_state = self.get_agent_by_id(agent_id=agent_id, actor=actor)
+        if agent_state.memory.compile() != new_memory.compile():
+            # update the blocks (LRW) in the DB
+            for label in agent_state.memory.list_block_labels():
+                updated_value = new_memory.get_block(label).value
+                if updated_value != agent_state.memory.get_block(label).value:
+                    # update the block if it's changed
+                    block_id = agent_state.memory.get_block(label).id
+                    block = self.block_manager.update_block(block_id=block_id, block_update=BlockUpdate(value=updated_value), actor=actor)
+
+            # refresh memory from DB (using block ids)
+            agent_state.memory = Memory(
+                blocks=[self.block_manager.get_block_by_id(block.id, actor=actor) for block in agent_state.memory.get_blocks()]
+            )
+
+            # NOTE: don't do this since re-buildin the memory is handled at the start of the step
+            # rebuild memory - this records the last edited timestamp of the memory
+            # TODO: pass in update timestamp from block edit time
+            agent_state = self.rebuild_system_prompt(agent_id=agent_id, actor=actor)
+
+        return agent_state
+
     # ======================================================================================================================
     # Source Management
     # ======================================================================================================================
     @enforce_types
-    def attach_source(self, agent_id: str, source_id: str, actor: PydanticUser) -> None:
+    def attach_source(self, agent_id: str, source_id: str, actor: PydanticUser) -> PydanticAgentState:
         """
         Attaches a source to an agent.
 
@@ -561,6 +683,7 @@ class AgentManager:
 
             # Commit the changes
             agent.update(session, actor=actor)
+            return agent.to_pydantic()
 
     @enforce_types
     def list_attached_sources(self, agent_id: str, actor: PydanticUser) -> List[PydanticSource]:
@@ -582,7 +705,7 @@ class AgentManager:
             return [source.to_pydantic() for source in agent.sources]
 
     @enforce_types
-    def detach_source(self, agent_id: str, source_id: str, actor: PydanticUser) -> None:
+    def detach_source(self, agent_id: str, source_id: str, actor: PydanticUser) -> PydanticAgentState:
         """
         Detaches a source from an agent.
 
@@ -596,10 +719,17 @@ class AgentManager:
             agent = AgentModel.read(db_session=session, identifier=agent_id, actor=actor)
 
             # Remove the source from the relationship
-            agent.sources = [s for s in agent.sources if s.id != source_id]
+            remaining_sources = [s for s in agent.sources if s.id != source_id]
+
+            if len(remaining_sources) == len(agent.sources):  # Source ID was not in the relationship
+                logger.warning(f"Attempted to remove unattached source id={source_id} from agent id={agent_id} by actor={actor}")
+
+            # Update the sources relationship
+            agent.sources = remaining_sources
 
             # Commit the changes
             agent.update(session, actor=actor)
+            return agent.to_pydantic()
 
     # ======================================================================================================================
     # Block management
@@ -705,7 +835,8 @@ class AgentManager:
         query_text: Optional[str] = None,
         start_date: Optional[datetime] = None,
         end_date: Optional[datetime] = None,
-        cursor: Optional[str] = None,
+        before: Optional[str] = None,
+        after: Optional[str] = None,
         source_id: Optional[str] = None,
         embed_query: bool = False,
         ascending: bool = True,
@@ -713,6 +844,7 @@ class AgentManager:
         agent_only: bool = False,
     ) -> Select:
         """Helper function to build the base passage query with all filters applied.
+        Supports both before and after pagination across merged source and agent passages.
 
         Returns the query before any limit or count operations are applied.
         """
@@ -800,30 +932,69 @@ class AgentManager:
                 else:
                     # SQLite with custom vector type
                     query_embedding_binary = adapt_array(embedded_text)
-                    if ascending:
-                        main_query = main_query.order_by(
-                            func.cosine_distance(combined_query.c.embedding, query_embedding_binary).asc(),
-                            combined_query.c.created_at.asc(),
-                            combined_query.c.id.asc(),
-                        )
-                    else:
-                        main_query = main_query.order_by(
-                            func.cosine_distance(combined_query.c.embedding, query_embedding_binary).asc(),
-                            combined_query.c.created_at.desc(),
-                            combined_query.c.id.asc(),
-                        )
+                    main_query = main_query.order_by(
+                        func.cosine_distance(combined_query.c.embedding, query_embedding_binary).asc(),
+                        combined_query.c.created_at.asc() if ascending else combined_query.c.created_at.desc(),
+                        combined_query.c.id.asc(),
+                    )
             else:
                 if query_text:
                     main_query = main_query.where(func.lower(combined_query.c.text).contains(func.lower(query_text)))
 
-            # Handle cursor-based pagination
-            if cursor:
-                cursor_query = select(combined_query.c.created_at).where(combined_query.c.id == cursor).scalar_subquery()
+            # Handle pagination
+            if before or after:
+                # Create reference CTEs
+                if before:
+                    before_ref = (
+                        select(combined_query.c.created_at, combined_query.c.id).where(combined_query.c.id == before).cte("before_ref")
+                    )
+                if after:
+                    after_ref = (
+                        select(combined_query.c.created_at, combined_query.c.id).where(combined_query.c.id == after).cte("after_ref")
+                    )
 
-                if ascending:
-                    main_query = main_query.where(combined_query.c.created_at > cursor_query)
+                if before and after:
+                    # Window-based query (get records between before and after)
+                    main_query = main_query.where(
+                        or_(
+                            combined_query.c.created_at < select(before_ref.c.created_at).scalar_subquery(),
+                            and_(
+                                combined_query.c.created_at == select(before_ref.c.created_at).scalar_subquery(),
+                                combined_query.c.id < select(before_ref.c.id).scalar_subquery(),
+                            ),
+                        )
+                    )
+                    main_query = main_query.where(
+                        or_(
+                            combined_query.c.created_at > select(after_ref.c.created_at).scalar_subquery(),
+                            and_(
+                                combined_query.c.created_at == select(after_ref.c.created_at).scalar_subquery(),
+                                combined_query.c.id > select(after_ref.c.id).scalar_subquery(),
+                            ),
+                        )
+                    )
                 else:
-                    main_query = main_query.where(combined_query.c.created_at < cursor_query)
+                    # Pure pagination (only before or only after)
+                    if before:
+                        main_query = main_query.where(
+                            or_(
+                                combined_query.c.created_at < select(before_ref.c.created_at).scalar_subquery(),
+                                and_(
+                                    combined_query.c.created_at == select(before_ref.c.created_at).scalar_subquery(),
+                                    combined_query.c.id < select(before_ref.c.id).scalar_subquery(),
+                                ),
+                            )
+                        )
+                    if after:
+                        main_query = main_query.where(
+                            or_(
+                                combined_query.c.created_at > select(after_ref.c.created_at).scalar_subquery(),
+                                and_(
+                                    combined_query.c.created_at == select(after_ref.c.created_at).scalar_subquery(),
+                                    combined_query.c.id > select(after_ref.c.id).scalar_subquery(),
+                                ),
+                            )
+                        )
 
             # Add ordering if not already ordered by similarity
             if not embed_query:
@@ -838,7 +1009,7 @@ class AgentManager:
                         combined_query.c.id.asc(),
                     )
 
-            return main_query
+        return main_query
 
     @enforce_types
     def list_passages(
@@ -850,7 +1021,8 @@ class AgentManager:
         query_text: Optional[str] = None,
         start_date: Optional[datetime] = None,
         end_date: Optional[datetime] = None,
-        cursor: Optional[str] = None,
+        before: Optional[str] = None,
+        after: Optional[str] = None,
         source_id: Optional[str] = None,
         embed_query: bool = False,
         ascending: bool = True,
@@ -866,7 +1038,8 @@ class AgentManager:
                 query_text=query_text,
                 start_date=start_date,
                 end_date=end_date,
-                cursor=cursor,
+                before=before,
+                after=after,
                 source_id=source_id,
                 embed_query=embed_query,
                 ascending=ascending,
@@ -906,7 +1079,8 @@ class AgentManager:
         query_text: Optional[str] = None,
         start_date: Optional[datetime] = None,
         end_date: Optional[datetime] = None,
-        cursor: Optional[str] = None,
+        before: Optional[str] = None,
+        after: Optional[str] = None,
         source_id: Optional[str] = None,
         embed_query: bool = False,
         ascending: bool = True,
@@ -922,7 +1096,8 @@ class AgentManager:
                 query_text=query_text,
                 start_date=start_date,
                 end_date=end_date,
-                cursor=cursor,
+                before=before,
+                after=after,
                 source_id=source_id,
                 embed_query=embed_query,
                 ascending=ascending,
@@ -1005,19 +1180,35 @@ class AgentManager:
             agent.update(session, actor=actor)
             return agent.to_pydantic()
 
+    @enforce_types
+    def list_attached_tools(self, agent_id: str, actor: PydanticUser) -> List[PydanticTool]:
+        """
+        List all tools attached to an agent.
+
+        Args:
+            agent_id: ID of the agent to list tools for.
+            actor: User performing the action.
+
+        Returns:
+            List[PydanticTool]: List of tools attached to the agent.
+        """
+        with self.session_maker() as session:
+            agent = AgentModel.read(db_session=session, identifier=agent_id, actor=actor)
+            return [tool.to_pydantic() for tool in agent.tools]
+
     # ======================================================================================================================
     # Tag Management
     # ======================================================================================================================
     @enforce_types
     def list_tags(
-        self, actor: PydanticUser, cursor: Optional[str] = None, limit: Optional[int] = 50, query_text: Optional[str] = None
+        self, actor: PydanticUser, after: Optional[str] = None, limit: Optional[int] = 50, query_text: Optional[str] = None
     ) -> List[str]:
         """
         Get all tags a user has created, ordered alphabetically.
 
         Args:
             actor: User performing the action.
-            cursor: Cursor for pagination.
+            after: Cursor for forward pagination.
             limit: Maximum number of tags to return.
             query_text: Query text to filter tags by.
 
@@ -1035,8 +1226,8 @@ class AgentManager:
             if query_text:
                 query = query.filter(AgentsTags.tag.ilike(f"%{query_text}%"))
 
-            if cursor:
-                query = query.filter(AgentsTags.tag > cursor)
+            if after:
+                query = query.filter(AgentsTags.tag > after)
 
             query = query.order_by(AgentsTags.tag).limit(limit)
             results = [tag[0] for tag in query.all()]

@@ -27,6 +27,7 @@ TOOL_CALL_ID_MAX_LEN = 29
 
 # minimum context window size
 MIN_CONTEXT_WINDOW = 4096
+DEFAULT_CONTEXT_WINDOW_SIZE = 32000
 
 # embeddings
 MAX_EMBEDDING_DIM = 4096  # maximum supported embeding size - do NOT change or else DBs will need to be reset
@@ -50,15 +51,20 @@ BASE_TOOLS = ["send_message", "conversation_search", "archival_memory_insert", "
 # Base memory tools CAN be edited, and are added by default by the server
 BASE_MEMORY_TOOLS = ["core_memory_append", "core_memory_replace"]
 # Multi agent tools
-MULTI_AGENT_TOOLS = ["send_message_to_specific_agent", "send_message_to_agents_matching_all_tags"]
-MULTI_AGENT_SEND_MESSAGE_MAX_RETRIES = 3
-MULTI_AGENT_SEND_MESSAGE_TIMEOUT = 20 * 60
+MULTI_AGENT_TOOLS = ["send_message_to_agent_and_wait_for_reply", "send_message_to_agents_matching_all_tags", "send_message_to_agent_async"]
+# Set of all built-in Letta tools
+LETTA_TOOL_SET = set(BASE_TOOLS + BASE_MEMORY_TOOLS + MULTI_AGENT_TOOLS)
 
 # The name of the tool used to send message to the user
 # May not be relevant in cases where the agent has multiple ways to message to user (send_imessage, send_discord_mesasge, ...)
 # or in cases where the agent has no concept of messaging a user (e.g. a workflow agent)
 DEFAULT_MESSAGE_TOOL = "send_message"
 DEFAULT_MESSAGE_TOOL_KWARG = "message"
+
+PRE_EXECUTION_MESSAGE_ARG = "pre_exec_msg"
+
+REQUEST_HEARTBEAT_PARAM = "request_heartbeat"
+
 
 # Structured output models
 STRUCTURED_OUTPUT_MODELS = {"gpt-4o", "gpt-4o-mini"}
@@ -87,6 +93,8 @@ NON_USER_MSG_PREFIX = "[This is an automated system message hidden from the user
 # The max amount of tokens supported by the underlying model (eg 8k for gpt-4 and Mistral 7B)
 LLM_MAX_TOKENS = {
     "DEFAULT": 8192,
+    "deepseek-chat": 64000,
+    "deepseek-reasoner": 64000,
     ## OpenAI models: https://platform.openai.com/docs/models/overview
     # "o1-preview
     "chatgpt-4o-latest": 128000,
@@ -125,8 +133,6 @@ LLM_MAX_TOKENS = {
     "gpt-3.5-turbo-16k-0613": 16385,  # legacy
     "gpt-3.5-turbo-0301": 4096,  # legacy
 }
-# The amount of tokens before a sytem warning about upcoming truncation is sent to Letta
-MESSAGE_SUMMARY_WARNING_FRAC = 0.75
 # The error message that Letta will receive
 # MESSAGE_SUMMARY_WARNING_STR = f"Warning: the conversation history will soon reach its maximum length and be trimmed. Make sure to save any important information from the conversation to your memory before it is removed."
 # Much longer and more specific variant of the prompt
@@ -138,14 +144,9 @@ MESSAGE_SUMMARY_WARNING_STR = " ".join(
         # "Remember to pass request_heartbeat = true if you would like to send a message immediately after.",
     ]
 )
-# The fraction of tokens we truncate down to
-MESSAGE_SUMMARY_TRUNC_TOKEN_FRAC = 0.75
+
 # The ackknowledgement message used in the summarize sequence
 MESSAGE_SUMMARY_REQUEST_ACK = "Understood, I will respond with a summary of the message (and only the summary, nothing else) once I receive the conversation history. I'm ready."
-
-# Even when summarizing, we want to keep a handful of recent messages
-# These serve as in-context examples of how to use functions / what user messages look like
-MESSAGE_SUMMARY_TRUNC_KEEP_N_LAST = 3
 
 # Maximum length of an error message
 MAX_ERROR_MESSAGE_CHAR_LIMIT = 500
@@ -157,6 +158,7 @@ CORE_MEMORY_BLOCK_CHAR_LIMIT: int = 5000
 
 # Function return limits
 FUNCTION_RETURN_CHAR_LIMIT = 6000  # ~300 words
+BASE_FUNCTION_RETURN_CHAR_LIMIT = 1000000  # very high (we rely on implementation)
 
 MAX_PAUSE_HEARTBEATS = 360  # in min
 

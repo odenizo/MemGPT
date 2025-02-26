@@ -2,6 +2,7 @@ import inspect
 import warnings
 from typing import Any, Dict, List, Optional, Type, Union, get_args, get_origin
 
+from composio.client.collections import ActionParametersModel
 from docstring_parser import parse
 from pydantic import BaseModel
 
@@ -228,12 +229,24 @@ def pydantic_model_to_json_schema(model: Type[BaseModel]) -> dict:
     """
     schema = model.model_json_schema()
 
-    def clean_property(prop: dict) -> dict:
+    def clean_property(prop: dict, full_schema: dict) -> dict:
         """Clean up a property schema to match desired format"""
 
         if "description" not in prop:
             raise ValueError(f"Property {prop} lacks a 'description' key")
 
+        # Handle the case where the property is a $ref to another model
+        if "$ref" in prop:
+            # Resolve the reference to the nested model
+            ref_schema = resolve_ref(prop["$ref"], full_schema)
+            # Recursively clean the nested model
+            return {
+                "type": "object",
+                **clean_schema(ref_schema, full_schema),
+                "description": prop["description"],
+            }
+
+        # If it's a regular property with a direct type (e.g., string, number)
         return {
             "type": "string" if prop["type"] == "string" else prop["type"],
             "description": prop["description"],
@@ -282,7 +295,7 @@ def pydantic_model_to_json_schema(model: Type[BaseModel]) -> dict:
                         "description": prop["description"],
                     }
                 else:
-                    properties[name] = clean_property(prop)
+                    properties[name] = clean_property(prop, full_schema)
 
             pydantic_model_schema_dict = {
                 "type": "object",
@@ -393,12 +406,12 @@ def generate_schema(function, name: Optional[str] = None, description: Optional[
     # append the heartbeat
     # TODO: don't hard-code
     # TODO: if terminal, don't include this
-    if function.__name__ not in ["send_message"]:
-        schema["parameters"]["properties"]["request_heartbeat"] = {
-            "type": "boolean",
-            "description": "Request an immediate heartbeat after function execution. Set to `True` if you want to send a follow-up message or run a follow-up function.",
-        }
-        schema["parameters"]["required"].append("request_heartbeat")
+    # if function.__name__ not in ["send_message"]:
+    schema["parameters"]["properties"]["request_heartbeat"] = {
+        "type": "boolean",
+        "description": "Request an immediate heartbeat after function execution. Set to `True` if you want to send a follow-up message or run a follow-up function.",
+    }
+    schema["parameters"]["required"].append("request_heartbeat")
 
     return schema
 
@@ -429,3 +442,70 @@ def generate_schema_from_args_schema_v2(
         function_call_json["parameters"]["required"].append("request_heartbeat")
 
     return function_call_json
+
+
+def generate_tool_schema_for_composio(
+    parameters_model: ActionParametersModel,
+    name: str,
+    description: str,
+    append_heartbeat: bool = True,
+    strict: bool = False,
+) -> Dict[str, Any]:
+    properties_json = {}
+    required_fields = parameters_model.required or []
+
+    # Extract properties from the ActionParametersModel
+    for field_name, field_props in parameters_model.properties.items():
+        # Initialize the property structure
+        property_schema = {
+            "type": field_props["type"],
+            "description": field_props.get("description", ""),
+        }
+
+        # Handle optional default values
+        if "default" in field_props:
+            property_schema["default"] = field_props["default"]
+
+        # Handle enumerations
+        if "enum" in field_props:
+            property_schema["enum"] = field_props["enum"]
+
+        # Handle array item types
+        if field_props["type"] == "array" and "items" in field_props:
+            property_schema["items"] = field_props["items"]
+
+        # Add the property to the schema
+        properties_json[field_name] = property_schema
+
+    # Add the optional heartbeat parameter
+    if append_heartbeat:
+        properties_json["request_heartbeat"] = {
+            "type": "boolean",
+            "description": "Request an immediate heartbeat after function execution. Set to `True` if you want to send a follow-up message or run a follow-up function.",
+        }
+        required_fields.append("request_heartbeat")
+
+    # Return the final schema
+    if strict:
+        # https://platform.openai.com/docs/guides/function-calling#strict-mode
+        return {
+            "name": name,
+            "description": description,
+            "strict": True,  # NOTE
+            "parameters": {
+                "type": "object",
+                "properties": properties_json,
+                "additionalProperties": False,  # NOTE
+                "required": required_fields,
+            },
+        }
+    else:
+        return {
+            "name": name,
+            "description": description,
+            "parameters": {
+                "type": "object",
+                "properties": properties_json,
+                "required": required_fields,
+            },
+        }
