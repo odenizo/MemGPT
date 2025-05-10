@@ -26,9 +26,7 @@ logger = get_logger(__name__)
     responses={
         200: {
             "description": "Successful response",
-            "content": {
-                "text/event-stream": {"description": "Server-Sent Events stream"},
-            },
+            "content": {"text/event-stream": {}},
         }
     },
 )
@@ -56,8 +54,6 @@ async def create_voice_chat_completions(
         block_manager=server.block_manager,
         passage_manager=server.passage_manager,
         actor=actor,
-        message_buffer_limit=40,
-        message_buffer_min=15,
     )
 
     # Return the streaming generator

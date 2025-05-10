@@ -42,9 +42,9 @@ from letta.schemas.block import Block, BlockUpdate, CreateBlock
 from letta.schemas.embedding_config import EmbeddingConfig
 
 # openai schemas
-from letta.schemas.enums import JobStatus, MessageStreamStatus
+from letta.schemas.enums import JobStatus, MessageStreamStatus, ProviderCategory, ProviderType
 from letta.schemas.environment_variables import SandboxEnvironmentVariableCreate
-from letta.schemas.group import GroupCreate, SleeptimeManager
+from letta.schemas.group import GroupCreate, ManagerType, SleeptimeManager, VoiceSleeptimeManager
 from letta.schemas.job import Job, JobUpdate
 from letta.schemas.letta_message import LegacyLettaMessage, LettaMessage, ToolReturnMessage
 from letta.schemas.letta_message_content import TextContent
@@ -244,9 +244,15 @@ class SyncServer(Server):
             tool_dir = tool_settings.tool_exec_dir or LETTA_TOOL_EXECUTION_DIR
 
             venv_dir = Path(tool_dir) / venv_name
-            if not Path(tool_dir).is_dir():
-                logger.error(f"Provided LETTA_TOOL_SANDBOX_DIR is not a valid directory: {tool_dir}")
+            tool_path = Path(tool_dir)
+
+            if tool_path.exists() and not tool_path.is_dir():
+                logger.error(f"LETTA_TOOL_SANDBOX_DIR exists but is not a directory: {tool_dir}")
             else:
+                if not tool_path.exists():
+                    logger.warning(f"LETTA_TOOL_SANDBOX_DIR does not exist, creating now: {tool_dir}")
+                    tool_path.mkdir(parents=True, exist_ok=True)
+
                 if tool_settings.tool_exec_venv_name and not venv_dir.is_dir():
                     logger.warning(
                         f"Provided LETTA_TOOL_SANDBOX_VENV_NAME is not a valid venv ({venv_dir}), one will be created for you during tool execution."
@@ -268,10 +274,11 @@ class SyncServer(Server):
                     )
 
         # collect providers (always has Letta as a default)
-        self._enabled_providers: List[Provider] = [LettaProvider()]
+        self._enabled_providers: List[Provider] = [LettaProvider(name="letta")]
         if model_settings.openai_api_key:
             self._enabled_providers.append(
                 OpenAIProvider(
+                    name="openai",
                     api_key=model_settings.openai_api_key,
                     base_url=model_settings.openai_api_base,
                 )
@@ -279,12 +286,14 @@ class SyncServer(Server):
         if model_settings.anthropic_api_key:
             self._enabled_providers.append(
                 AnthropicProvider(
+                    name="anthropic",
                     api_key=model_settings.anthropic_api_key,
                 )
             )
         if model_settings.ollama_base_url:
             self._enabled_providers.append(
                 OllamaProvider(
+                    name="ollama",
                     base_url=model_settings.ollama_base_url,
                     api_key=None,
                     default_prompt_formatter=model_settings.default_prompt_formatter,
@@ -293,12 +302,14 @@ class SyncServer(Server):
         if model_settings.gemini_api_key:
             self._enabled_providers.append(
                 GoogleAIProvider(
+                    name="google_ai",
                     api_key=model_settings.gemini_api_key,
                 )
             )
         if model_settings.google_cloud_location and model_settings.google_cloud_project:
             self._enabled_providers.append(
                 GoogleVertexProvider(
+                    name="google_vertex",
                     google_cloud_project=model_settings.google_cloud_project,
                     google_cloud_location=model_settings.google_cloud_location,
                 )
@@ -307,6 +318,7 @@ class SyncServer(Server):
             assert model_settings.azure_api_version, "AZURE_API_VERSION is required"
             self._enabled_providers.append(
                 AzureProvider(
+                    name="azure",
                     api_key=model_settings.azure_api_key,
                     base_url=model_settings.azure_base_url,
                     api_version=model_settings.azure_api_version,
@@ -315,12 +327,14 @@ class SyncServer(Server):
         if model_settings.groq_api_key:
             self._enabled_providers.append(
                 GroqProvider(
+                    name="groq",
                     api_key=model_settings.groq_api_key,
                 )
             )
         if model_settings.together_api_key:
             self._enabled_providers.append(
                 TogetherProvider(
+                    name="together",
                     api_key=model_settings.together_api_key,
                     default_prompt_formatter=model_settings.default_prompt_formatter,
                 )
@@ -329,6 +343,7 @@ class SyncServer(Server):
             # vLLM exposes both a /chat/completions and a /completions endpoint
             self._enabled_providers.append(
                 VLLMCompletionsProvider(
+                    name="vllm",
                     base_url=model_settings.vllm_api_base,
                     default_prompt_formatter=model_settings.default_prompt_formatter,
                 )
@@ -338,12 +353,14 @@ class SyncServer(Server):
             # e.g. "... --enable-auto-tool-choice --tool-call-parser hermes"
             self._enabled_providers.append(
                 VLLMChatCompletionsProvider(
+                    name="vllm",
                     base_url=model_settings.vllm_api_base,
                 )
             )
         if model_settings.aws_access_key and model_settings.aws_secret_access_key and model_settings.aws_region:
             self._enabled_providers.append(
                 AnthropicBedrockProvider(
+                    name="bedrock",
                     aws_region=model_settings.aws_region,
                 )
             )
@@ -355,37 +372,37 @@ class SyncServer(Server):
                 if model_settings.lmstudio_base_url.endswith("/v1")
                 else model_settings.lmstudio_base_url + "/v1"
             )
-            self._enabled_providers.append(LMStudioOpenAIProvider(base_url=lmstudio_url))
+            self._enabled_providers.append(LMStudioOpenAIProvider(name="lmstudio_openai", base_url=lmstudio_url))
         if model_settings.deepseek_api_key:
-            self._enabled_providers.append(DeepSeekProvider(api_key=model_settings.deepseek_api_key))
+            self._enabled_providers.append(DeepSeekProvider(name="deepseek", api_key=model_settings.deepseek_api_key))
         if model_settings.xai_api_key:
-            self._enabled_providers.append(XAIProvider(api_key=model_settings.xai_api_key))
+            self._enabled_providers.append(XAIProvider(name="xai", api_key=model_settings.xai_api_key))
 
         # For MCP
         """Initialize the MCP clients (there may be multiple)"""
-        # mcp_server_configs = self.get_mcp_servers()
+        mcp_server_configs = self.get_mcp_servers()
         self.mcp_clients: Dict[str, BaseMCPClient] = {}
-        #
-        # for server_name, server_config in mcp_server_configs.items():
-        #     if server_config.type == MCPServerType.SSE:
-        #         self.mcp_clients[server_name] = SSEMCPClient(server_config)
-        #     elif server_config.type == MCPServerType.STDIO:
-        #         self.mcp_clients[server_name] = StdioMCPClient(server_config)
-        #     else:
-        #         raise ValueError(f"Invalid MCP server config: {server_config}")
-        #
-        #     try:
-        #         self.mcp_clients[server_name].connect_to_server()
-        #     except Exception as e:
-        #         logger.error(e)
-        #         self.mcp_clients.pop(server_name)
-        #
-        # # Print out the tools that are connected
-        # for server_name, client in self.mcp_clients.items():
-        #     logger.info(f"Attempting to fetch tools from MCP server: {server_name}")
-        #     mcp_tools = client.list_tools()
-        #     logger.info(f"MCP tools connected: {', '.join([t.name for t in mcp_tools])}")
-        #     logger.debug(f"MCP tools: {', '.join([str(t) for t in mcp_tools])}")
+
+        for server_name, server_config in mcp_server_configs.items():
+            if server_config.type == MCPServerType.SSE:
+                self.mcp_clients[server_name] = SSEMCPClient(server_config)
+            elif server_config.type == MCPServerType.STDIO:
+                self.mcp_clients[server_name] = StdioMCPClient(server_config)
+            else:
+                raise ValueError(f"Invalid MCP server config: {server_config}")
+
+            try:
+                self.mcp_clients[server_name].connect_to_server()
+            except Exception as e:
+                logger.error(e)
+                self.mcp_clients.pop(server_name)
+
+        # Print out the tools that are connected
+        for server_name, client in self.mcp_clients.items():
+            logger.info(f"Attempting to fetch tools from MCP server: {server_name}")
+            mcp_tools = client.list_tools()
+            logger.info(f"MCP tools connected: {', '.join([t.name for t in mcp_tools])}")
+            logger.debug(f"MCP tools: {', '.join([str(t) for t in mcp_tools])}")
 
         # TODO: Remove these in memory caches
         self._llm_config_cache = {}
@@ -397,7 +414,9 @@ class SyncServer(Server):
     def load_agent(self, agent_id: str, actor: User, interface: Union[AgentInterface, None] = None) -> Agent:
         """Updated method to load agents from persisted storage"""
         agent_state = self.agent_manager.get_agent_by_id(agent_id=agent_id, actor=actor)
-        if agent_state.multi_agent_group:
+        # TODO: Think about how to integrate voice sleeptime into sleeptime
+        # TODO: Voice sleeptime agents turn into normal agents when being messaged
+        if agent_state.multi_agent_group and agent_state.multi_agent_group.manager_type != ManagerType.voice_sleeptime:
             return load_multi_agent(
                 group=agent_state.multi_agent_group, agent_state=agent_state, actor=actor, interface=interface, mcp_clients=self.mcp_clients
             )
@@ -715,17 +734,17 @@ class SyncServer(Server):
         return self._command(user_id=user_id, agent_id=agent_id, command=command)
 
     @trace_method
-    def get_cached_llm_config(self, **kwargs):
+    def get_cached_llm_config(self, actor: User, **kwargs):
         key = make_key(**kwargs)
         if key not in self._llm_config_cache:
-            self._llm_config_cache[key] = self.get_llm_config_from_handle(**kwargs)
+            self._llm_config_cache[key] = self.get_llm_config_from_handle(actor=actor, **kwargs)
         return self._llm_config_cache[key]
 
     @trace_method
-    def get_cached_embedding_config(self, **kwargs):
+    def get_cached_embedding_config(self, actor: User, **kwargs):
         key = make_key(**kwargs)
         if key not in self._embedding_config_cache:
-            self._embedding_config_cache[key] = self.get_embedding_config_from_handle(**kwargs)
+            self._embedding_config_cache[key] = self.get_embedding_config_from_handle(actor=actor, **kwargs)
         return self._embedding_config_cache[key]
 
     @trace_method
@@ -747,7 +766,7 @@ class SyncServer(Server):
                 "enable_reasoner": request.enable_reasoner,
             }
             log_event(name="start get_cached_llm_config", attributes=config_params)
-            request.llm_config = self.get_cached_llm_config(**config_params)
+            request.llm_config = self.get_cached_llm_config(actor=actor, **config_params)
             log_event(name="end get_cached_llm_config", attributes=config_params)
 
         if request.embedding_config is None:
@@ -758,7 +777,7 @@ class SyncServer(Server):
                 "embedding_chunk_size": request.embedding_chunk_size or constants.DEFAULT_EMBEDDING_CHUNK_SIZE,
             }
             log_event(name="start get_cached_embedding_config", attributes=embedding_config_params)
-            request.embedding_config = self.get_cached_embedding_config(**embedding_config_params)
+            request.embedding_config = self.get_cached_embedding_config(actor=actor, **embedding_config_params)
             log_event(name="end get_cached_embedding_config", attributes=embedding_config_params)
 
         log_event(name="start create_agent db")
@@ -769,7 +788,10 @@ class SyncServer(Server):
         log_event(name="end create_agent db")
 
         if request.enable_sleeptime:
-            main_agent = self.create_sleeptime_agent(main_agent=main_agent, actor=actor)
+            if request.agent_type == AgentType.voice_convo_agent:
+                main_agent = self.create_voice_sleeptime_agent(main_agent=main_agent, actor=actor)
+            else:
+                main_agent = self.create_sleeptime_agent(main_agent=main_agent, actor=actor)
 
         return main_agent
 
@@ -780,15 +802,18 @@ class SyncServer(Server):
         actor: User,
     ) -> AgentState:
         if request.model is not None:
-            request.llm_config = self.get_llm_config_from_handle(handle=request.model)
+            request.llm_config = self.get_llm_config_from_handle(handle=request.model, actor=actor)
 
         if request.embedding is not None:
-            request.embedding_config = self.get_embedding_config_from_handle(handle=request.embedding)
+            request.embedding_config = self.get_embedding_config_from_handle(handle=request.embedding, actor=actor)
 
         if request.enable_sleeptime:
             agent = self.agent_manager.get_agent_by_id(agent_id=agent_id, actor=actor)
             if agent.multi_agent_group is None:
-                self.create_sleeptime_agent(main_agent=agent, actor=actor)
+                if agent.agent_type == AgentType.voice_convo_agent:
+                    self.create_voice_sleeptime_agent(main_agent=agent, actor=actor)
+                else:
+                    self.create_sleeptime_agent(main_agent=agent, actor=actor)
 
         return self.agent_manager.update_agent(
             agent_id=agent_id,
@@ -822,6 +847,40 @@ class SyncServer(Server):
                 manager_config=SleeptimeManager(
                     manager_agent_id=main_agent.id,
                     sleeptime_agent_frequency=5,
+                ),
+            ),
+            actor=actor,
+        )
+        return self.agent_manager.get_agent_by_id(agent_id=main_agent.id, actor=actor)
+
+    def create_voice_sleeptime_agent(self, main_agent: AgentState, actor: User) -> AgentState:
+        # TODO: Inject system
+        request = CreateAgent(
+            name=main_agent.name + "-sleeptime",
+            agent_type=AgentType.voice_sleeptime_agent,
+            block_ids=[block.id for block in main_agent.memory.blocks],
+            memory_blocks=[
+                CreateBlock(
+                    label="memory_persona",
+                    value=get_persona_text("voice_memory_persona"),
+                ),
+            ],
+            llm_config=LLMConfig.default_config("gpt-4.1"),
+            embedding_config=main_agent.embedding_config,
+            project_id=main_agent.project_id,
+        )
+        voice_sleeptime_agent = self.agent_manager.create_agent(
+            agent_create=request,
+            actor=actor,
+        )
+        self.group_manager.create_group(
+            group=GroupCreate(
+                description="Low latency voice chat with async memory management.",
+                agent_ids=[voice_sleeptime_agent.id],
+                manager_config=VoiceSleeptimeManager(
+                    manager_agent_id=main_agent.id,
+                    max_message_buffer_length=constants.DEFAULT_MAX_MESSAGE_BUFFER_LENGTH,
+                    min_message_buffer_length=constants.DEFAULT_MIN_MESSAGE_BUFFER_LENGTH,
                 ),
             ),
             actor=actor,
@@ -1142,38 +1201,76 @@ class SyncServer(Server):
         except NoResultFound:
             raise HTTPException(status_code=404, detail=f"Organization with id {org_id} not found")
 
-    def list_llm_models(self) -> List[LLMConfig]:
+    def list_llm_models(
+        self,
+        actor: User,
+        provider_category: Optional[List[ProviderCategory]] = None,
+        provider_name: Optional[str] = None,
+        provider_type: Optional[ProviderType] = None,
+    ) -> List[LLMConfig]:
         """List available models"""
         llm_models = []
-        for provider in self.get_enabled_providers():
+        for provider in self.get_enabled_providers(
+            provider_category=provider_category,
+            provider_name=provider_name,
+            provider_type=provider_type,
+            actor=actor,
+        ):
             try:
                 llm_models.extend(provider.list_llm_models())
             except Exception as e:
+                import traceback
+
+                traceback.print_exc()
                 warnings.warn(f"An error occurred while listing LLM models for provider {provider}: {e}")
 
         llm_models.extend(self.get_local_llm_configs())
 
         return llm_models
 
-    def list_embedding_models(self) -> List[EmbeddingConfig]:
+    def list_embedding_models(self, actor: User) -> List[EmbeddingConfig]:
         """List available embedding models"""
         embedding_models = []
-        for provider in self.get_enabled_providers():
+        for provider in self.get_enabled_providers(actor):
             try:
                 embedding_models.extend(provider.list_embedding_models())
             except Exception as e:
                 warnings.warn(f"An error occurred while listing embedding models for provider {provider}: {e}")
         return embedding_models
 
-    def get_enabled_providers(self):
-        providers_from_env = {p.name: p for p in self._enabled_providers}
-        providers_from_db = {p.name: p for p in self.provider_manager.list_providers()}
-        # Merge the two dictionaries, keeping the values from providers_from_db where conflicts occur
-        return {**providers_from_env, **providers_from_db}.values()
+    def get_enabled_providers(
+        self,
+        actor: User,
+        provider_category: Optional[List[ProviderCategory]] = None,
+        provider_name: Optional[str] = None,
+        provider_type: Optional[ProviderType] = None,
+    ) -> List[Provider]:
+        providers = []
+        if not provider_category or ProviderCategory.base in provider_category:
+            providers_from_env = [p for p in self._enabled_providers]
+            providers.extend(providers_from_env)
+
+        if not provider_category or ProviderCategory.byok in provider_category:
+            providers_from_db = self.provider_manager.list_providers(
+                name=provider_name,
+                provider_type=provider_type,
+                actor=actor,
+            )
+            providers_from_db = [p.cast_to_subtype() for p in providers_from_db]
+            providers.extend(providers_from_db)
+
+        if provider_name is not None:
+            providers = [p for p in providers if p.name == provider_name]
+
+        if provider_type is not None:
+            providers = [p for p in providers if p.provider_type == provider_type]
+
+        return providers
 
     @trace_method
     def get_llm_config_from_handle(
         self,
+        actor: User,
         handle: str,
         context_window_limit: Optional[int] = None,
         max_tokens: Optional[int] = None,
@@ -1182,7 +1279,7 @@ class SyncServer(Server):
     ) -> LLMConfig:
         try:
             provider_name, model_name = handle.split("/", 1)
-            provider = self.get_provider_from_name(provider_name)
+            provider = self.get_provider_from_name(provider_name, actor)
 
             llm_configs = [config for config in provider.list_llm_models() if config.handle == handle]
             if not llm_configs:
@@ -1226,11 +1323,11 @@ class SyncServer(Server):
 
     @trace_method
     def get_embedding_config_from_handle(
-        self, handle: str, embedding_chunk_size: int = constants.DEFAULT_EMBEDDING_CHUNK_SIZE
+        self, actor: User, handle: str, embedding_chunk_size: int = constants.DEFAULT_EMBEDDING_CHUNK_SIZE
     ) -> EmbeddingConfig:
         try:
             provider_name, model_name = handle.split("/", 1)
-            provider = self.get_provider_from_name(provider_name)
+            provider = self.get_provider_from_name(provider_name, actor)
 
             embedding_configs = [config for config in provider.list_embedding_models() if config.handle == handle]
             if not embedding_configs:
@@ -1253,8 +1350,8 @@ class SyncServer(Server):
 
         return embedding_config
 
-    def get_provider_from_name(self, provider_name: str) -> Provider:
-        providers = [provider for provider in self._enabled_providers if provider.name == provider_name]
+    def get_provider_from_name(self, provider_name: str, actor: User) -> Provider:
+        providers = [provider for provider in self.get_enabled_providers(actor) if provider.name == provider_name]
         if not providers:
             raise ValueError(f"Provider {provider_name} is not supported")
         elif len(providers) > 1:
@@ -1579,6 +1676,7 @@ class SyncServer(Server):
         assistant_message_tool_name: str = constants.DEFAULT_MESSAGE_TOOL,
         assistant_message_tool_kwarg: str = constants.DEFAULT_MESSAGE_TOOL_KWARG,
         metadata: Optional[dict] = None,
+        request_start_timestamp_ns: Optional[int] = None,
     ) -> Union[StreamingResponse, LettaResponse]:
         """Split off into a separate function so that it can be imported in the /chat/completion proxy."""
         # TODO: @charles is this the correct way to handle?
@@ -1663,6 +1761,8 @@ class SyncServer(Server):
                         streaming_interface.get_generator(),
                         usage_task=task,
                         finish_message=include_final_message,
+                        request_start_timestamp_ns=request_start_timestamp_ns,
+                        llm_config=llm_config,
                     ),
                     media_type="text/event-stream",
                 )
