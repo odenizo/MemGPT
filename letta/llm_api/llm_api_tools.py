@@ -24,6 +24,7 @@ from letta.llm_api.openai import (
 from letta.local_llm.chat_completion_proxy import get_chat_completion
 from letta.local_llm.constants import INNER_THOUGHTS_KWARG, INNER_THOUGHTS_KWARG_DESCRIPTION
 from letta.local_llm.utils import num_tokens_from_functions, num_tokens_from_messages
+from letta.schemas.enums import ProviderCategory
 from letta.schemas.llm_config import LLMConfig
 from letta.schemas.message import Message
 from letta.schemas.openai.chat_completion_request import ChatCompletionRequest, cast_message_to_subtype
@@ -171,6 +172,12 @@ def create(
         if model_settings.openai_api_key is None and llm_config.model_endpoint == "https://api.openai.com/v1":
             # only is a problem if we are *not* using an openai proxy
             raise LettaConfigurationError(message="OpenAI key is missing from letta config file", missing_fields=["openai_api_key"])
+        elif llm_config.provider_category == ProviderCategory.byok:
+            from letta.services.provider_manager import ProviderManager
+            from letta.services.user_manager import UserManager
+
+            actor = UserManager().get_user_or_default(user_id=user_id)
+            api_key = ProviderManager().get_override_key(llm_config.provider_name, actor=actor)
         elif model_settings.openai_api_key is None:
             # the openai python client requires a dummy API key
             api_key = "DUMMY_API_KEY"
@@ -208,6 +215,9 @@ def create(
                 chat_completion_request=data,
                 stream_interface=stream_interface,
                 name=name,
+                # NOTE: needs to be true for OpenAI proxies that use the `reasoning_content` field
+                # For example, DeepSeek, or LM Studio
+                expect_reasoning_content=False,
             )
         else:  # Client did not request token streaming (expect a blocking backend response)
             data.stream = False
@@ -265,6 +275,9 @@ def create(
                 chat_completion_request=data,
                 stream_interface=stream_interface,
                 name=name,
+                # TODO turn on to support reasoning content from xAI reasoners:
+                # https://docs.x.ai/docs/guides/reasoning#reasoning
+                expect_reasoning_content=False,
             )
         else:  # Client did not request token streaming (expect a blocking backend response)
             data.stream = False
@@ -373,7 +386,10 @@ def create(
                 stream_interface=stream_interface,
                 extended_thinking=llm_config.enable_reasoner,
                 max_reasoning_tokens=llm_config.max_reasoning_tokens,
+                provider_name=llm_config.provider_name,
+                provider_category=llm_config.provider_category,
                 name=name,
+                user_id=user_id,
             )
 
         else:
@@ -383,6 +399,9 @@ def create(
                 put_inner_thoughts_in_kwargs=llm_config.put_inner_thoughts_in_kwargs,
                 extended_thinking=llm_config.enable_reasoner,
                 max_reasoning_tokens=llm_config.max_reasoning_tokens,
+                provider_name=llm_config.provider_name,
+                provider_category=llm_config.provider_category,
+                user_id=user_id,
             )
 
         if llm_config.put_inner_thoughts_in_kwargs:
@@ -473,7 +492,10 @@ def create(
         if stream:
             raise NotImplementedError(f"Streaming not yet implemented for TogetherAI (via the /completions endpoint).")
 
-        if model_settings.together_api_key is None and llm_config.model_endpoint == "https://api.together.ai/v1/completions":
+        if model_settings.together_api_key is None and (
+            llm_config.model_endpoint == "https://api.together.ai/v1/completions"
+            or llm_config.model_endpoint == "https://api.together.xyz/v1/completions"
+        ):
             raise LettaConfigurationError(message="TogetherAI key is missing from letta config file", missing_fields=["together_api_key"])
 
         return get_chat_completion(
@@ -547,6 +569,8 @@ def create(
                 chat_completion_request=data,
                 stream_interface=stream_interface,
                 name=name,
+                # TODO should we toggle for R1 vs V3?
+                expect_reasoning_content=True,
             )
         else:  # Client did not request token streaming (expect a blocking backend response)
             data.stream = False
