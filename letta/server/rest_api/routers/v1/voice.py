@@ -26,9 +26,7 @@ logger = get_logger(__name__)
     responses={
         200: {
             "description": "Successful response",
-            "content": {
-                "text/event-stream": {"description": "Server-Sent Events stream"},
-            },
+            "content": {"text/event-stream": {}},
         }
     },
 )
@@ -38,7 +36,7 @@ async def create_voice_chat_completions(
     server: "SyncServer" = Depends(get_letta_server),
     user_id: Optional[str] = Header(None, alias="user_id"),
 ):
-    actor = server.user_manager.get_user_or_default(user_id=user_id)
+    actor = await server.user_manager.get_actor_or_default_async(actor_id=user_id)
 
     # Create OpenAI async client
     client = openai.AsyncClient(
@@ -56,8 +54,6 @@ async def create_voice_chat_completions(
         block_manager=server.block_manager,
         passage_manager=server.passage_manager,
         actor=actor,
-        message_buffer_limit=40,
-        message_buffer_min=15,
     )
 
     # Return the streaming generator

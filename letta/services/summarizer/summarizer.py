@@ -1,9 +1,9 @@
 import asyncio
 import json
 import traceback
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
-from letta.agents.ephemeral_memory_agent import EphemeralMemoryAgent
+from letta.constants import DEFAULT_MESSAGE_TOOL, DEFAULT_MESSAGE_TOOL_KWARG
 from letta.log import get_logger
 from letta.schemas.enums import MessageRole
 from letta.schemas.letta_message_content import TextContent
@@ -21,7 +21,11 @@ class Summarizer:
     """
 
     def __init__(
-        self, mode: SummarizationMode, summarizer_agent: EphemeralMemoryAgent, message_buffer_limit: int = 10, message_buffer_min: int = 3
+        self,
+        mode: SummarizationMode,
+        summarizer_agent: Optional["VoiceSleeptimeAgent"] = None,
+        message_buffer_limit: int = 10,
+        message_buffer_min: int = 3,
     ):
         self.mode = mode
 
@@ -77,7 +81,7 @@ class Summarizer:
 
         logger.info("Buffer length hit, evicting messages.")
 
-        target_trim_index = len(all_in_context_messages) - self.message_buffer_min + 1
+        target_trim_index = len(all_in_context_messages) - self.message_buffer_min
 
         while target_trim_index < len(all_in_context_messages) and all_in_context_messages[target_trim_index].role != MessageRole.user:
             target_trim_index += 1
@@ -89,41 +93,38 @@ class Summarizer:
             logger.info("Nothing to evict, returning in context messages as is.")
             return all_in_context_messages, False
 
-        evicted_messages = all_in_context_messages[1:target_trim_index]
+        if self.summarizer_agent:
+            # Only invoke if summarizer agent is passed in
 
-        # Format
-        formatted_evicted_messages = format_transcript(evicted_messages)
-        formatted_in_context_messages = format_transcript(updated_in_context_messages)
+            evicted_messages = all_in_context_messages[1:target_trim_index]
 
-        # Update the message transcript of the memory agent
-        self.summarizer_agent.update_message_transcript(message_transcripts=formatted_evicted_messages + formatted_in_context_messages)
+            # Format
+            formatted_evicted_messages = format_transcript(evicted_messages)
+            formatted_in_context_messages = format_transcript(updated_in_context_messages)
 
-        # Add line numbers to the formatted messages
-        line_number = 0
-        for i in range(len(formatted_evicted_messages)):
-            formatted_evicted_messages[i] = f"{line_number}. " + formatted_evicted_messages[i]
-            line_number += 1
-        for i in range(len(formatted_in_context_messages)):
-            formatted_in_context_messages[i] = f"{line_number}. " + formatted_in_context_messages[i]
-            line_number += 1
+            # TODO: This is hyperspecific to voice, generalize!
+            # Update the message transcript of the memory agent
+            self.summarizer_agent.update_message_transcript(message_transcripts=formatted_evicted_messages + formatted_in_context_messages)
 
-        evicted_messages_str = "\n".join(formatted_evicted_messages)
-        in_context_messages_str = "\n".join(formatted_in_context_messages)
-        summary_request_text = f"""You are a specialized memory recall agent assisting another AI agent by asynchronously reorganizing its memory storage. The LLM agent you are helping maintains a limited context window that retains only the most recent {self.message_buffer_min} messages from its conversations. The provided conversation history includes messages that are about to be evicted from its context window, as well as some additional recent messages for extra clarity and context.
+            # Add line numbers to the formatted messages
+            offset = len(formatted_evicted_messages)
+            formatted_evicted_messages = [f"{i}. {msg}" for (i, msg) in enumerate(formatted_evicted_messages)]
+            formatted_in_context_messages = [f"{i + offset}. {msg}" for (i, msg) in enumerate(formatted_in_context_messages)]
 
-Your task is to carefully review the provided conversation history and proactively generate detailed, relevant memories about the human participant, specifically targeting information contained in messages that are about to be evicted from the context window. Your notes will help preserve critical insights, events, or facts that would otherwise be forgotten.
+            evicted_messages_str = "\n".join(formatted_evicted_messages)
+            in_context_messages_str = "\n".join(formatted_in_context_messages)
+            summary_request_text = f"""You’re a memory-recall helper for an AI that can only keep the last {self.message_buffer_min} messages. Scan the conversation history, focusing on messages about to drop out of that window, and write crisp notes that capture any important facts or insights about the human so they aren’t lost.
 
-(Older) Evicted Messages:
-{evicted_messages_str}
+    (Older) Evicted Messages:\n
+    {evicted_messages_str}\n
 
-(Newer) In-Context Messages:
-{in_context_messages_str}
-"""
-
-        # Fire-and-forget the summarization task
-        self.fire_and_forget(
-            self.summarizer_agent.step([MessageCreate(role=MessageRole.user, content=[TextContent(text=summary_request_text)])])
-        )
+    (Newer) In-Context Messages:\n
+    {in_context_messages_str}
+    """
+            # Fire-and-forget the summarization task
+            self.fire_and_forget(
+                self.summarizer_agent.step([MessageCreate(role=MessageRole.user, content=[TextContent(text=summary_request_text)])])
+            )
 
         return [all_in_context_messages[0]] + updated_in_context_messages, True
 
@@ -152,6 +153,9 @@ def format_transcript(messages: List[Message], include_system: bool = False) -> 
 
         # 1) Try plain content
         if msg.content:
+            # Skip tool messages where the name is "send_message"
+            if msg.role == MessageRole.tool and msg.name == DEFAULT_MESSAGE_TOOL:
+                continue
             text = "".join(c.text for c in msg.content).strip()
 
         # 2) Otherwise, try extracting from function calls
@@ -159,11 +163,14 @@ def format_transcript(messages: List[Message], include_system: bool = False) -> 
             parts = []
             for call in msg.tool_calls:
                 args_str = call.function.arguments
-                try:
-                    args = json.loads(args_str)
-                    # pull out a "message" field if present
-                    parts.append(args.get("message", args_str))
-                except json.JSONDecodeError:
+                if call.function.name == DEFAULT_MESSAGE_TOOL:
+                    try:
+                        args = json.loads(args_str)
+                        # pull out a "message" field if present
+                        parts.append(args.get(DEFAULT_MESSAGE_TOOL_KWARG, args_str))
+                    except json.JSONDecodeError:
+                        parts.append(args_str)
+                else:
                     parts.append(args_str)
             text = " ".join(parts).strip()
 
